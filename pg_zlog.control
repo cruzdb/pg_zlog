@@ -1,0 +1,3 @@
+comment = 'zlog postgres'
+default_version = '0.1'
+module_pathname = '$libdir/pg_zlog'
