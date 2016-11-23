@@ -13,3 +13,20 @@ BEGIN
 	VALUES (new_table_oid);
 END;
 $BODY$ LANGUAGE plpgsql;
+
+CREATE FUNCTION pgzlog_apply_update(query text)
+RETURNS void
+as $BODY$
+BEGIN
+	PERFORM pg_advisory_xact_lock(29030, hashtext('mylog'));
+
+	SET LOCAL pg_zlog.enabled TO false;
+
+    RAISE DEBUG 'Executing: %', query;
+
+    BEGIN
+        EXECUTE query;
+    EXCEPTION WHEN others THEN
+    END;
+END;
+$BODY$ LANGUAGE 'plpgsql';
