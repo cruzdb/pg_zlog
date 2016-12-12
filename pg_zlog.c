@@ -3,6 +3,7 @@
 #include "access/stratnum.h"
 #include "access/skey.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -13,6 +14,7 @@
 #include "storage/lockdefs.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/tqual.h"
 #include "utils/lsyscache.h"
@@ -24,6 +26,8 @@
 #define PG_ZLOG_METADATA_SCHEMA_NAME "pgzlog_metadata"
 #define PG_ZLOG_REPLICATED_TABLE_NAME "replicated_tables"
 #define ATTR_NUM_REPLICATED_TABLES_RELATION_ID 1
+#define ATTR_NUM_REPLICATED_TABLES_LOG 2
+#define MAX_ZLOG_LOG_NAME_LENGTH 128
 
 PG_MODULE_MAGIC;
 
@@ -149,6 +153,92 @@ static bool HasZLogTable(List *rangeTableList)
 	return false;
 }
 
+/*
+ *
+ */
+static char *ZLogTableLog(Oid zlogTableOid)
+{
+	char *logName;
+	RangeVar *heapRangeVar;
+	Relation heapRelation;
+	HeapScanDesc scanDesc;
+	const int scanKeyCount = 1;
+	ScanKeyData scanKey[scanKeyCount];
+	HeapTuple heapTuple;
+
+	heapRangeVar = makeRangeVar(PG_ZLOG_METADATA_SCHEMA_NAME,
+			PG_ZLOG_REPLICATED_TABLE_NAME, -1);
+	heapRelation = relation_openrv(heapRangeVar, AccessShareLock);
+
+	ScanKeyInit(&scanKey[0], ATTR_NUM_REPLICATED_TABLES_RELATION_ID, InvalidStrategy,
+				F_OIDEQ, ObjectIdGetDatum(zlogTableOid));
+
+	scanDesc = heap_beginscan(heapRelation, SnapshotSelf, scanKeyCount, scanKey);
+
+	heapTuple = heap_getnext(scanDesc, ForwardScanDirection);
+	if (HeapTupleIsValid(heapTuple))
+	{
+		TupleDesc tupleDescriptor = RelationGetDescr(heapRelation);
+		bool isNull = false;
+
+		Datum logNameDatum = heap_getattr(heapTuple,
+			ATTR_NUM_REPLICATED_TABLES_LOG, tupleDescriptor, &isNull);
+		logName = TextDatumGetCString(logNameDatum);
+	}
+	else
+	{
+		logName = NULL;
+	}
+
+	heap_endscan(scanDesc);
+	relation_close(heapRelation, AccessShareLock);
+
+	return logName;
+}
+
+/*
+ *
+ */
+static char *GetLogName(List *rangeTableList)
+{
+	ListCell *rangeTableCell;
+	char *queryLogName = NULL;
+
+	foreach(rangeTableCell, rangeTableList)
+	{
+		char *tableLogName;
+
+		Oid rangeTableOid = ExtractTableOid((Node*)lfirst(rangeTableCell));
+		if (rangeTableOid == InvalidOid)
+		{
+			continue;
+		}
+
+		tableLogName = ZLogTableLog(rangeTableOid);
+		if (tableLogName == NULL)
+		{
+			char *relationName = get_rel_name(rangeTableOid);
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+				errmsg("relation \"%s\" is not managed by pg_zlog", relationName)));
+		}
+		else if (queryLogName == NULL)
+		{
+			queryLogName = tableLogName;
+		}
+		else
+		{
+			int compare = strncmp(tableLogName, queryLogName, MAX_ZLOG_LOG_NAME_LENGTH);
+			if (compare)
+			{
+				ereport(ERROR, (errmsg("cannot run queries spanning more than a single log.")));
+			}
+		}
+	}
+
+	return queryLogName;
+
+}
+
 struct ZLogConn {
 	bool r, i, l;
 	rados_t rados;
@@ -220,11 +310,38 @@ static void ZLogConnDisconnect(struct ZLogConn *conn)
 		rados_shutdown(conn->rados);
 }
 
+static int64 ZLogLastAppliedPos(const char *logName)
+{
+	int64 pos;
+	Datum posDatum;
+	bool isNull;
+	Oid argTypes[] = {
+		TEXTOID
+	};
+	Datum argValues[] = {
+		CStringGetTextDatum(logName)
+	};
+
+	SPI_connect();
+
+	SPI_execute_with_args(
+		"SELECT last_applied_pos FROM pgzlog_metadata.log WHERE name = $1",
+		1, argTypes, argValues, NULL, false, 1);
+
+	posDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+			1, &isNull);
+	pos = DatumGetInt64(posDatum);
+
+	SPI_finish();
+
+	return pos;
+}
+
 /*
  * TODO:
  *   - support optimistic consistency mode (read-your-own-writes)
  */
-static void PrepareConsistentRead(void)
+static void PrepareConsistentRead(const char *logName)
 {
 	uint64_t pos;
 	uint64_t cur;
@@ -244,6 +361,8 @@ static void PrepareConsistentRead(void)
 		return;
 	}
 
+	cur = ZLogLastAppliedPos(logName);
+
 	SPI_connect();
 
 	/*
@@ -254,7 +373,7 @@ static void PrepareConsistentRead(void)
 	 *   - handle errors like not-written and filled
 	 *   - handle large query strings. is there psql limit?
 	 */
-	for (cur = 0; cur < pos; cur++) {
+	for (; cur < pos; cur++) {
 		ret = zlog_read(conn.log, cur, readQuery, sizeof(readQuery));
 		if (ret < 0) {
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
@@ -287,15 +406,15 @@ static void PrepareConsistentRead(void)
 	ZLogConnDisconnect(&conn);
 }
 
-static void PrepareConsistentWrite(const char *queryString)
+static void PrepareConsistentWrite(const char *logName, const char *queryString)
 {
 	uint64_t pos;
 	uint64_t cur;
 	int ret;
 	char readQuery[4096];
 	struct ZLogConn conn;
-	Oid argTypes[1];
-	Datum argValues[1];
+	Oid argTypes[3];
+	Datum argValues[3];
 
 	ZLogConnInit(&conn);
 	ZLogConnect(&conn);
@@ -308,7 +427,9 @@ static void PrepareConsistentWrite(const char *queryString)
 		return;
 	}
 
-		SPI_connect();
+	cur = ZLogLastAppliedPos(logName);
+
+	SPI_connect();
 
 	/*
 	 * Execute preceeding queries.
@@ -318,7 +439,7 @@ static void PrepareConsistentWrite(const char *queryString)
 	 *   - handle errors like not-written and filled
 	 *   - handle large query strings. is there psql limit?
 	 */
-	for (cur = 0; cur < pos; cur++) {
+	for (; cur < pos; cur++) {
 		ret = zlog_read(conn.log, cur, readQuery, sizeof(readQuery));
 		if (ret < 0) {
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
@@ -333,8 +454,11 @@ static void PrepareConsistentWrite(const char *queryString)
 
 		argTypes[0] = TEXTOID;
 		argValues[0] = CStringGetTextDatum(readQuery);
-		ret = SPI_execute_with_args("SELECT pgzlog_apply_update($1)",
-				1, argTypes, argValues, NULL, false, 1);
+		argTypes[1] = INT8OID;
+		argValues[1] = Int64GetDatum(cur);
+
+		ret = SPI_execute_with_args("SELECT pgzlog_apply_update($1,$2)",
+				2, argTypes, argValues, NULL, false, 1);
 		if (ret < 0) {
 			ereport(WARNING, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 				errmsg("PrepareConsistentWrite:SPI_execute: %d", ret)));
@@ -370,7 +494,8 @@ static void PgZLogProcessUtility(Node *parsetree, const char *queryString,
 			List *relations = truncateStatement->relations;
 			if (HasZLogTable(relations))
 			{
-				PrepareConsistentWrite(queryString);
+				char *logName = GetLogName(relations);
+				PrepareConsistentWrite(logName, queryString);
 			}
 		}
 		else if (statementType == T_IndexStmt)
@@ -379,7 +504,8 @@ static void PgZLogProcessUtility(Node *parsetree, const char *queryString,
 			Oid tableOid = ExtractTableOid((Node *) indexStatement->relation);
 			if (IsZLogTable(tableOid))
 			{
-				PrepareConsistentWrite(queryString);
+				char *logName = ZLogTableLog(tableOid);
+				PrepareConsistentWrite(logName, queryString);
 			}
 		}
 		else if (statementType == T_AlterTableStmt)
@@ -422,7 +548,8 @@ static void PgZLogProcessUtility(Node *parsetree, const char *queryString,
 
 				if (HasZLogTable(parsedQuery->rtable))
 				{
-					PrepareConsistentRead();
+					char *logName = GetLogName(parsedQuery->rtable);
+					PrepareConsistentRead(logName);
 				}
 			}
 		}
