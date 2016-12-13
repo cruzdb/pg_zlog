@@ -33,11 +33,11 @@ BEGIN
 END;
 $BODY$ LANGUAGE plpgsql;
 
-CREATE FUNCTION pgzlog_apply_update(query text, pos bigint)
+CREATE FUNCTION pgzlog_apply_update(log_name text, query text, pos bigint)
 RETURNS void
 as $BODY$
 BEGIN
-	PERFORM pg_advisory_xact_lock(29030, hashtext('mylog'));
+	PERFORM pg_advisory_xact_lock(29030, hashtext(log_name));
 
 	SET LOCAL pg_zlog.enabled TO false;
 
@@ -48,8 +48,8 @@ BEGIN
     EXCEPTION WHEN others THEN
     END;
 
-	UPDATE pgzlog_metadata.replicated_tables
-	SET last_applied_pos = pos
-	WHERE group_id = current_group_id;
+    UPDATE pgzlog_metadata.log
+    SET last_applied_pos = pos
+    WHERE name = log_name;
 END;
 $BODY$ LANGUAGE 'plpgsql';

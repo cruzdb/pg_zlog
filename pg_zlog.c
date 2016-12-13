@@ -37,6 +37,17 @@ static bool ZLogEnabled = true;
 /* restore these hooks on unload */
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 
+typedef struct ZLogConn {
+	rados_t rados;
+	bool connected;
+
+	rados_ioctx_t ioctx;
+	bool ioctx_open;
+
+	zlog_log_t log;
+	bool log_open;
+} ZLogConn;
+
 /*
  * TODO:
  *   - what is the purpose of checking things like the extension being
@@ -239,78 +250,121 @@ static char *GetLogName(List *rangeTableList)
 
 }
 
-struct ZLogConn {
-	bool r, i, l;
-	rados_t rados;
-	rados_ioctx_t ioctx;
-	zlog_log_t log;
-};
-
-static void ZLogConnInit(struct ZLogConn *conn)
+/*
+ *
+ */
+static void
+PutConnection(ZLogConn *conn)
 {
-	conn->r = false;
-	conn->i = false;
-	conn->l = false;
-}
-
-static void ZLogConnect(struct ZLogConn *conn)
-{
-	int ret;
-
-	ret = rados_create(&conn->rados, NULL);
-	if (ret)
+	if (conn == NULL)
 	{
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not create rados cluster object: ret=%d", ret)));
+		return;
 	}
 
-	conn->r = true;
-
-	ret = rados_conf_read_file(conn->rados, "/home/nwatkins/ceph/build/ceph.conf");
-	if (ret)
+	if (conn->log_open)
 	{
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not rados read conf: ret=%d", ret)));
-	}
-
-	ret = rados_connect(conn->rados);
-	if (ret)
-	{
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not connect to rados: ret=%d", ret)));
-	}
-
-	ret = rados_ioctx_create(conn->rados, "rbd", &conn->ioctx);
-	if (ret)
-	{
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not open ioctx: ret=%d", ret)));
-	}
-
-	conn->i = true;
-
-	ret = zlog_open_or_create(conn->ioctx, "mylog", "localhost", "5678", &conn->log);
-	if (ret)
-	{
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not create log instance ret=%d", ret)));
-	}
-
-	conn->l = true;
-
-}
-
-static void ZLogConnDisconnect(struct ZLogConn *conn)
-{
-	if (conn->l)
 		zlog_destroy(conn->log);
-	if (conn->i)
+	}
+
+	if (conn->ioctx_open)
+	{
 		rados_ioctx_destroy(conn->ioctx);
-	if (conn->r)
+	}
+
+	if (conn->connected)
+	{
 		rados_shutdown(conn->rados);
+	}
+
+	pfree(conn);
 }
 
-static int64 ZLogLastAppliedPos(const char *logName)
+/*
+ *
+ */
+static ZLogConn *
+GetConnection(const char *name, const char *conf)
+{
+	ZLogConn *volatile conn = NULL;
+
+	PG_TRY();
+	{
+		int ret;
+
+		conn = (ZLogConn *) palloc0(sizeof(*conn));
+
+		ret = rados_create(&conn->rados, NULL);
+		if (ret)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("pg_zlog could not create rados context: %d", ret)));
+		}
+
+		ret = rados_conf_read_file(conn->rados, conf);
+		if (ret)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("pg_zlog could not configure rados context: %d", ret)));
+		}
+
+		ret = rados_connect(conn->rados);
+		if (ret)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("pg_zlog could not connect to cluster: %d", ret)));
+		}
+
+		conn->connected = true;
+
+		ret = rados_ioctx_create(conn->rados, "rbd", &conn->ioctx);
+		if (ret)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("pg_zlog could not open ioctx: %d", ret)));
+		}
+
+		conn->ioctx_open = true;
+
+		ret = zlog_open_or_create(conn->ioctx, name, "localhost", "5678", &conn->log);
+		if (ret)
+		{
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("pg_zlog could not open log: %d", ret)));
+		}
+	}
+	PG_CATCH();
+	{
+		PutConnection(conn);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return conn;
+}
+
+static void
+ZLogSetApplied(const char *logName, int64 pos)
+{
+	Oid argTypes[] = {
+		TEXTOID,
+		INT8OID
+	};
+	Datum argValues[] = {
+		CStringGetTextDatum(logName),
+		Int64GetDatum(pos)
+	};
+
+	SPI_connect();
+
+	SPI_execute_with_args(
+		"UPDATE pgzlog_metadata.log SET last_applied_pos = $2 WHERE name = $1",
+		2, argTypes, argValues, NULL, false, 1);
+
+	SPI_finish();
+}
+
+static int64
+ZLogLastAppliedPos(const char *logName)
 {
 	int64 pos;
 	Datum posDatum;
@@ -339,143 +393,108 @@ static int64 ZLogLastAppliedPos(const char *logName)
 
 /*
  * TODO:
- *   - support optimistic consistency mode (read-your-own-writes)
+ * - handle errors like not-written and filled
+ * - handle large query strings. is there psql limit?
  */
-static void PrepareConsistentRead(const char *logName)
+static void
+ApplyLogEntries(ZLogConn *conn, const char *logName,
+		const int64 start, const int64 end)
 {
-	uint64_t pos;
-	uint64_t cur;
-	int ret;
-	char readQuery[4096];
-	struct ZLogConn conn;
-	Oid argTypes[1];
-	Datum argValues[1];
+	int64 cur;
 
-	ZLogConnInit(&conn);
-	ZLogConnect(&conn);
-
-	ret = zlog_checktail(conn.log, &pos);
-	if (ret) {
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("PrepareConsistentREAD:CheckTail: %d", ret)));
+	if (start > end)
+	{
+		ereport(ERROR, (errmsg("pg_zlog unexpected from/to "
+			INT64_FORMAT "/" INT64_FORMAT, start, end)));
+	}
+	else if (start == end)
+	{
 		return;
 	}
 
-	cur = ZLogLastAppliedPos(logName);
-
 	SPI_connect();
 
-	/*
-	 * Execute preceeding queries.
-	 *
-	 * TODO:
-	 *   - cur should start from db state
-	 *   - handle errors like not-written and filled
-	 *   - handle large query strings. is there psql limit?
-	 */
-	for (; cur < pos; cur++) {
-		ret = zlog_read(conn.log, cur, readQuery, sizeof(readQuery));
-		if (ret < 0) {
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("PrepareConsistentRead:Read: %d", ret)));
-			return;
+	for (cur = start; cur < end; cur++)
+	{
+		char readQuery[4096];
+		Datum argValues[3];
+		Oid argTypes[] = {
+			TEXTOID,
+			TEXTOID,
+			INT8OID
+		};
+
+		int ret = zlog_read(conn->log, cur, readQuery, sizeof(readQuery));
+		if (ret < 0)
+		{
+			ereport(ERROR, (errmsg("pg_zlog cannot read log: %d", ret)));
 		}
 
-		ereport(WARNING, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("MOG PrepareConsistentRead:Read %llu/%s",
-				(unsigned long long)cur, readQuery)));
+		argValues[0] = CStringGetTextDatum(logName);
+		argValues[1] = CStringGetTextDatum(readQuery);
+		argValues[2] = Int64GetDatum(cur);
 
-
-		argTypes[0] = TEXTOID;
-		argValues[0] = CStringGetTextDatum(readQuery);
-		ret = SPI_execute_with_args("SELECT pgzlog_apply_update($1)",
-				1, argTypes, argValues, NULL, false, 1);
-		if (ret < 0) {
-			ereport(WARNING, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("PrepareConsistentRead:SPI_execute: %d", ret)));
-		} else {
-			ereport(WARNING, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("PrepareConsistentRead:SPI_execute: %d", ret)));
+		ret = SPI_execute_with_args("SELECT pgzlog_apply_update($1,$2,$3)",
+				3, argTypes, argValues, NULL, false, 1);
+		if (ret < 0)
+		{
+			ereport(ERROR, (errmsg("pg_zlog cannot apply query: %d", ret)));
 		}
 	}
 
 	SPI_finish();
 	CommandCounterIncrement();
+}
 
-	//CommandCounterIncrement();
-	ZLogConnDisconnect(&conn);
+/*
+ * TODO:
+ *   - support optimistic consistency mode (read-your-own-writes)
+ */
+static void PrepareConsistentRead(const char *logName)
+{
+	uint64_t tail;
+	int64 last_applied;
+	int ret;
+	ZLogConn *conn;
+
+	conn = GetConnection(logName, "/home/nwatkins/ceph/build/ceph.conf");
+
+	ret = zlog_checktail(conn->log, &tail);
+	if (ret)
+	{
+		ereport(ERROR, (errmsg("pg_zlog could not check tail: %d", ret)));
+	}
+
+	last_applied = ZLogLastAppliedPos(logName);
+
+	ApplyLogEntries(conn, logName, last_applied+1, (int64)tail);
+
+	PutConnection(conn);
 }
 
 static void PrepareConsistentWrite(const char *logName, const char *queryString)
 {
-	uint64_t pos;
-	uint64_t cur;
 	int ret;
-	char readQuery[4096];
-	struct ZLogConn conn;
-	Oid argTypes[3];
-	Datum argValues[3];
+	uint64_t appended_pos;
+	int64 last_applied;
+	ZLogConn *conn;
 
-	ZLogConnInit(&conn);
-	ZLogConnect(&conn);
+	conn = GetConnection(logName, "/home/nwatkins/ceph/build/ceph.conf");
 
-	ret = zlog_append(conn.log, (void*)queryString,
-			strlen(queryString)+1, &pos);
-	if (ret) {
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("PrepareConsistentWrite:Append: %d", ret)));
-		return;
+	ret = zlog_append(conn->log, (void*)queryString,
+			strlen(queryString)+1, &appended_pos);
+	if (ret)
+	{
+		ereport(ERROR, (errmsg("pg_zlog could not append to log: %d", ret)));
 	}
 
-	cur = ZLogLastAppliedPos(logName);
+	last_applied = ZLogLastAppliedPos(logName);
 
-	SPI_connect();
+	ApplyLogEntries(conn, logName, last_applied+1, (int64)appended_pos);
 
-	/*
-	 * Execute preceeding queries.
-	 *
-	 * TODO:
-	 *   - cur should start from db state
-	 *   - handle errors like not-written and filled
-	 *   - handle large query strings. is there psql limit?
-	 */
-	for (; cur < pos; cur++) {
-		ret = zlog_read(conn.log, cur, readQuery, sizeof(readQuery));
-		if (ret < 0) {
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("PrepareConsistentWrite:Read: %d", ret)));
-			return;
-		}
+	ZLogSetApplied(logName, (int64)appended_pos);
 
-		ereport(WARNING, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("MOG PrepareConsistentWrite:Read %llu/%s",
-				(unsigned long long)cur, readQuery)));
-
-
-		argTypes[0] = TEXTOID;
-		argValues[0] = CStringGetTextDatum(readQuery);
-		argTypes[1] = INT8OID;
-		argValues[1] = Int64GetDatum(cur);
-
-		ret = SPI_execute_with_args("SELECT pgzlog_apply_update($1,$2)",
-				2, argTypes, argValues, NULL, false, 1);
-		if (ret < 0) {
-			ereport(WARNING, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("PrepareConsistentWrite:SPI_execute: %d", ret)));
-		} else {
-			ereport(WARNING, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("PrepareConsistentWrite:SPI_execute: %d", ret)));
-		}
-	}
-		SPI_finish();
-	CommandCounterIncrement();
-
-	ereport(WARNING, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		errmsg("PrepareConsistentWrite: %s", queryString),
-		errhint("pos: %llu", (unsigned long long)pos)));
-
-	//CommandCounterIncrement();
-	ZLogConnDisconnect(&conn);
+	PutConnection(conn);
 }
 
 /*
