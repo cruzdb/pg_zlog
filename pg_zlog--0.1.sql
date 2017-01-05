@@ -33,13 +33,19 @@ BEGIN
 END;
 $BODY$ LANGUAGE plpgsql;
 
+CREATE FUNCTION pgzlog_start_update(log_name text)
+RETURNS void
+as $BODY$
+BEGIN
+    PERFORM pg_advisory_xact_lock(29030, hashtext(log_name));
+    SET LOCAL pg_zlog.enabled TO false;
+END;
+$BODY$ LANGUAGE 'plpgsql';
+
 CREATE FUNCTION pgzlog_apply_update(log_name text, query text, pos bigint)
 RETURNS void
 as $BODY$
 BEGIN
-	PERFORM pg_advisory_xact_lock(29030, hashtext(log_name));
-
-	SET LOCAL pg_zlog.enabled TO false;
 
     RAISE DEBUG 'Executing: %', query;
 
@@ -53,3 +59,11 @@ BEGIN
     WHERE name = log_name;
 END;
 $BODY$ LANGUAGE 'plpgsql';
+
+/*
+ * zlog_execute executes a query locally, by-passing the query logging logic.
+ */
+CREATE FUNCTION zlog_execute(INTERNAL)
+RETURNS void
+LANGUAGE C
+AS 'MODULE_PATHNAME', $$zlog_execute$$;

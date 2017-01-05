@@ -1,5 +1,5 @@
 MODULE_big = pg_zlog
-OBJS = pg_zlog.o
+OBJS = pg_zlog.o ruleutils_94.o ruleutils_95.o ruleutils_96.o
 EXTENSION = pg_zlog
 DATA = pg_zlog--0.1.sql
 
@@ -18,7 +18,7 @@ testdb:
 		= 'pg_zlog'/" testdb_data/postgresql.conf
 
 testdbrun:
-	postgres -D testdb_data
+	postgres -D testdb_data -d 1
 
 testdbinit:
 	echo 'CREATE EXTENSION pg_zlog;' | psql postgres
