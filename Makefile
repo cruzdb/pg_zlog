@@ -11,17 +11,20 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+TEST_DB_NAME ?= testdb_data1
+TEST_DB_PORT ?= 5432
+
 testdb:
-	rm -rf testdb_data
-	initdb -D testdb_data -A trust
+	rm -rf $(TEST_DB_NAME)
+	initdb -D $(TEST_DB_NAME) -A trust
 	sed -i "/shared_preload_libraries/s/.*/shared_preload_libraries \
-		= 'pg_zlog'/" testdb_data/postgresql.conf
+		= 'pg_zlog'/" $(TEST_DB_NAME)/postgresql.conf
 
 testdbrun:
-	postgres -D testdb_data -d 1
+	postgres -D $(TEST_DB_NAME) -p $(TEST_DB_PORT)
 
 testdbinit:
-	echo 'CREATE EXTENSION pg_zlog;' | psql postgres
-	echo 'CREATE TABLE coordinates (x int, y int);' | psql postgres
-	echo "SELECT pgzlog_create_log('mylog1', 'rbd', null);" | psql postgres
-	echo "SELECT pgzlog_replicate_table('mylog1', 'coordinates');" | psql postgres
+	echo 'CREATE EXTENSION pg_zlog;' | psql postgres -p $(TEST_DB_PORT)
+	echo 'CREATE TABLE coordinates (x int, y int);' | psql postgres -p $(TEST_DB_PORT)
+	echo "SELECT pgzlog_create_log('mylog1', 'rbd', null);" | psql postgres -p $(TEST_DB_PORT)
+	echo "SELECT pgzlog_replicate_table('mylog1', 'coordinates');" | psql postgres -p $(TEST_DB_PORT)
