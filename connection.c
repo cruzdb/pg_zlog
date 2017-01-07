@@ -1,10 +1,49 @@
 #include "postgres.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 #include "pg_zlog.h"
 #include <rados/librados.h>
 #include <zlog/capi.h>
 
-ZLogConn *GetConnection(const char *name, const char *conf)
+typedef int ConnCacheKey;
+
+typedef struct ConnCacheEntry
+{
+	ConnCacheKey key;
+	ZLogConn *conn;
+} ConnCacheEntry;
+
+static HTAB *ConnectionHash = NULL;
+
+static void
+PutConnection(ZLogConn *conn)
+{
+	if (conn == NULL)
+	{
+		return;
+	}
+
+	if (conn->log_open)
+	{
+		zlog_destroy(conn->log);
+	}
+
+	if (conn->ioctx_open)
+	{
+		rados_ioctx_destroy(conn->ioctx);
+	}
+
+	if (conn->connected)
+	{
+		rados_shutdown(conn->rados);
+	}
+
+	pfree(conn);
+}
+
+static ZLogConn *
+OpenConnection(const char *name, const char *conf)
 {
 	ZLogConn *volatile conn = NULL;
 
@@ -12,7 +51,7 @@ ZLogConn *GetConnection(const char *name, const char *conf)
 	{
 		int ret;
 
-		conn = (ZLogConn *) palloc0(sizeof(*conn));
+		conn = MemoryContextAlloc(CacheMemoryContext, sizeof(*conn));
 
 		ret = rados_create(&conn->rados, NULL);
 		if (ret)
@@ -63,28 +102,36 @@ ZLogConn *GetConnection(const char *name, const char *conf)
 	return conn;
 }
 
-void PutConnection(ZLogConn *conn)
+ZLogConn *
+GetConnection(const char *name, const char *conf)
 {
-	if (conn == NULL)
+	bool found;
+	ConnCacheEntry *entry;
+	ConnCacheKey key;
+
+	if (ConnectionHash == NULL)
 	{
-		return;
+		HASHCTL ctl;
+
+		MemSet(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(ConnCacheKey);
+		ctl.entrysize = sizeof(ConnCacheEntry);
+		ctl.hcxt = CacheMemoryContext;
+
+		ConnectionHash = hash_create("pg_zlog connections", 8, &ctl,
+			HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 
-	if (conn->log_open)
+	entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
+	if (!found)
 	{
-		zlog_destroy(conn->log);
+		entry->conn = NULL;
 	}
 
-	if (conn->ioctx_open)
+	if (entry->conn == NULL)
 	{
-		rados_ioctx_destroy(conn->ioctx);
+		entry->conn = OpenConnection(name, conf);
 	}
 
-	if (conn->connected)
-	{
-		rados_shutdown(conn->rados);
-	}
-
-	pfree(conn);
+	return entry->conn;
 }
-

@@ -401,8 +401,6 @@ static void PrepareConsistentRead(const char *logName)
 
 	ApplyLogEntries(conn, logName, last_applied+1, (int64)tail);
 	CommandCounterIncrement();
-
-	PutConnection(conn);
 }
 
 static void PrepareConsistentWrite(const char *logName, const char *queryString)
@@ -428,8 +426,6 @@ static void PrepareConsistentWrite(const char *logName, const char *queryString)
 
 	ZLogSetApplied(logName, (int64)appended_pos);
 	CommandCounterIncrement();
-
-	PutConnection(conn);
 }
 
 /*

@@ -19,7 +19,6 @@ typedef struct ZLogConn {
 } ZLogConn;
 
 ZLogConn *GetConnection(const char *name, const char *conf);
-void PutConnection(ZLogConn *conn);
 
 extern void deparse_query(Query *query, StringInfo buffer);
 
