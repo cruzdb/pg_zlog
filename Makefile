@@ -1,5 +1,5 @@
 MODULE_big = pg_zlog
-OBJS = pg_zlog.o ruleutils_94.o ruleutils_95.o ruleutils_96.o
+OBJS = pg_zlog.o connection.o ruleutils_94.o ruleutils_95.o ruleutils_96.o
 EXTENSION = pg_zlog
 DATA = pg_zlog--0.1.sql
 
