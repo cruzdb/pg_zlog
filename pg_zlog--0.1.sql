@@ -1,37 +1,118 @@
 CREATE SCHEMA pgzlog_metadata
 
-    CREATE TABLE "log" (
+    /* ceph cluster connections */
+    CREATE TABLE "cluster" (
         name text not null,
-        pool text not null,
-        conf text default null,
-        last_applied_pos bigint not null default -1,
+        fsid text not null,
+        conf_path text default null,
         PRIMARY KEY (name)
     )
 
+    /* storage pools */
+    CREATE TABLE "pool" (
+        name text not null,
+        id bigint not null,
+        cluster text not null,
+        PRIMARY KEY (name),
+        FOREIGN KEY (cluster) REFERENCES pgzlog_metadata.cluster (name)
+    )
+
+    /* zlog instances */
+    CREATE TABLE "log" (
+        name text not null,
+        pool text not null,
+        host text default null,
+        port text default null,
+        last_applied_pos bigint not null default -1,
+        PRIMARY KEY (name),
+        FOREIGN KEY (pool) REFERENCES pgzlog_metadata.pool (name)
+    )
+
+    /* tables that are replicated on logs */
 	CREATE TABLE "replicated_tables" (
 		table_oid regclass not null,
-        log_name text not null,
+        log text not null,
 		PRIMARY KEY (table_oid),
-        FOREIGN KEY (log_name) REFERENCES pgzlog_metadata.log (name)
+        FOREIGN KEY (log) REFERENCES pgzlog_metadata.log (name)
 	);
 
-CREATE FUNCTION pgzlog_create_log(log_name text, pool_name text, conf_path text)
+/*
+ * Register a cluster.
+ */
+CREATE FUNCTION pgzlog_add_cluster(name text, conf_path text)
+RETURNS void
+AS $BODY$
+DECLARE
+    fsid text;
+BEGIN
+    SELECT * FROM ceph_cluster_fsid(conf_path) INTO fsid;
+    INSERT INTO pgzlog_metadata.cluster (name, fsid, conf_path)
+        VALUES (name, fsid, conf_path);
+END;
+$BODY$ LANGUAGE 'plpgsql';
+
+/*
+ * Register a storage pool.
+ */
+CREATE FUNCTION pgzlog_add_pool(cluster_name text, pool_name text)
+RETURNS void
+AS $BODY$
+DECLARE
+    pool_id bigint;
+BEGIN
+    SELECT * FROM ceph_pool_id(cluster_name, pool_name) INTO pool_id;
+    INSERT INTO pgzlog_metadata.pool (name, id, cluster)
+    VALUES (pool_name, pool_id, cluster_name);
+END;
+$BODY$ LANGUAGE 'plpgsql';
+
+/*
+ * Register a zlog instance.
+ */
+CREATE FUNCTION pgzlog_add_log(pool_name text, log_name text, host text, port text)
 RETURNS void
 AS $BODY$
 BEGIN
-    INSERT INTO pgzlog_metadata.log (name, pool, conf)
-    VALUES (log_name, pool_name, conf_path);
+    INSERT INTO pgzlog_metadata.log (name, pool, host, port)
+    VALUES (log_name, pool_name, host, port);
 END;
-$BODY$ LANGUAGE plpgsql;
+$BODY$ LANGUAGE 'plpgsql';
 
+/*
+ * Register a table for replication on a log.
+ */
 CREATE FUNCTION pgzlog_replicate_table(log_name text, table_oid regclass)
 RETURNS void
 AS $BODY$
 BEGIN
-	INSERT INTO pgzlog_metadata.replicated_tables (table_oid, log_name)
+	INSERT INTO pgzlog_metadata.replicated_tables (table_oid, log)
 	VALUES (table_oid, log_name);
 END;
-$BODY$ LANGUAGE plpgsql;
+$BODY$ LANGUAGE 'plpgsql';
+
+/*
+ * Retrieve the unique identifer of a cluster.
+ */
+CREATE FUNCTION ceph_cluster_fsid(conf_path text)
+RETURNS text
+LANGUAGE C
+AS 'MODULE_PATHNAME', $$ceph_cluster_fsid$$;
+
+/*
+ * Retrieve the identification number of the named pool.
+ */
+CREATE FUNCTION ceph_pool_id(cluster_name text, pool_name text)
+RETURNS bigint
+LANGUAGE C STRICT
+AS 'MODULE_PATHNAME', $$ceph_pool_id$$;
+
+/*
+ * zlog_execute executes a query locally, by-passing the query logging logic.
+ */
+CREATE FUNCTION zlog_execute(INTERNAL)
+RETURNS void
+LANGUAGE C
+AS 'MODULE_PATHNAME', $$zlog_execute$$;
 
 CREATE FUNCTION pgzlog_start_update(log_name text)
 RETURNS void
@@ -59,11 +140,3 @@ BEGIN
     WHERE name = log_name;
 END;
 $BODY$ LANGUAGE 'plpgsql';
-
-/*
- * zlog_execute executes a query locally, by-passing the query logging logic.
- */
-CREATE FUNCTION zlog_execute(INTERNAL)
-RETURNS void
-LANGUAGE C
-AS 'MODULE_PATHNAME', $$zlog_execute$$;

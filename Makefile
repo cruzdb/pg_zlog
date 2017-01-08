@@ -26,5 +26,7 @@ testdbrun:
 testdbinit:
 	echo 'CREATE EXTENSION pg_zlog;' | psql postgres -p $(TEST_DB_PORT)
 	echo 'CREATE TABLE coordinates (x int, y int);' | psql postgres -p $(TEST_DB_PORT)
-	echo "SELECT pgzlog_create_log('mylog1', 'rbd', null);" | psql postgres -p $(TEST_DB_PORT)
-	echo "SELECT pgzlog_replicate_table('mylog1', 'coordinates');" | psql postgres -p $(TEST_DB_PORT)
+	echo "SELECT pgzlog_add_cluster('ceph', null);" | psql postgres -p $(TEST_DB_PORT)
+	echo "SELECT pgzlog_add_pool('ceph', 'rbd');" | psql postgres -p $(TEST_DB_PORT)
+	echo "SELECT pgzlog_add_log('rbd', 'log0', null, null);" | psql postgres -p $(TEST_DB_PORT)
+	echo "SELECT pgzlog_replicate_table('log0', 'coordinates');" | psql postgres -p $(TEST_DB_PORT)
