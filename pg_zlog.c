@@ -29,7 +29,6 @@
 #include <zlog/capi.h>
 
 #define PG_ZLOG_EXTENSION_NAME "pg_zlog"
-#define PG_ZLOG_METADATA_SCHEMA_NAME "pgzlog_metadata"
 #define PG_ZLOG_REPLICATED_TABLE_NAME "replicated_tables"
 #define ATTR_NUM_REPLICATED_TABLES_RELATION_ID 1
 #define ATTR_NUM_REPLICATED_TABLES_LOG 2
@@ -389,7 +388,7 @@ static void PrepareConsistentRead(const char *logName)
 	int ret;
 	ZLogConn *conn;
 
-	conn = GetConnection(logName, "/home/nwatkins/ceph/build/ceph.conf");
+	conn = GetConnection(logName);
 
 	ret = zlog_checktail(conn->log, &tail);
 	if (ret)
@@ -410,7 +409,7 @@ static void PrepareConsistentWrite(const char *logName, const char *queryString)
 	int64 last_applied;
 	ZLogConn *conn;
 
-	conn = GetConnection(logName, "/home/nwatkins/ceph/build/ceph.conf");
+	conn = GetConnection(logName);
 
 	ret = zlog_append(conn->log, (void*)queryString,
 			strlen(queryString)+1, &appended_pos);
