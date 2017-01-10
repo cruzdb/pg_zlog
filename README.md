@@ -1,3 +1,21 @@
+# pg_zlog - replicated PostgreSQL tables in Ceph
+
+The `pg_zlog` extension provides logical table replication for PostgreSQL.
+Replication is implemented by logging table mutations to a consistent
+shared-log called [ZLog](https://github.com/noahdesu/zlog) that runs on the
+[Ceph](https://github.com/ceph/ceph) distributed storage system. Strong
+consistency is provided by rolling the log forward on any PostgreSQL node
+before executing a query on a replicated table.
+
+This extension is based on [pg_paxos](https://github.com/citusdata/pg_paxos)
+that uses PL/pgSQL to implement a Paxos-based shared-log for recording table
+mutations. The primary difference between `pg_zlog` and `pg_paxos` is that
+`pg_zlog` decouples the log implementation from PostgreSQL, allowing it to
+support the high-performance [ZLog](https://github.com/noahdesu/zlog) log
+implementation, removing the overheads associated with maintaining a quorum of
+PostgreSQL nodes, and supporting flexible storage options like replication and
+erasure-coding that are provided by [Ceph](https://github.com/ceph/ceph).
+
 # configuration
 
 ## add a cluster
