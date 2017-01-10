@@ -114,29 +114,52 @@ RETURNS void
 LANGUAGE C
 AS 'MODULE_PATHNAME', $$zlog_execute$$;
 
-CREATE FUNCTION pgzlog_start_update(log_name text)
+/*
+ *
+ */
+CREATE FUNCTION pgzlog_apply_log(log_name text, tail_log_pos bigint)
 RETURNS void
-as $BODY$
+AS $BODY$
+DECLARE
+    current_log_pos bigint;
+    query text;
 BEGIN
     PERFORM pg_advisory_xact_lock(29030, hashtext(log_name));
     SET LOCAL pg_zlog.enabled TO false;
-END;
-$BODY$ LANGUAGE 'plpgsql';
 
-CREATE FUNCTION pgzlog_apply_update(log_name text, query text, pos bigint)
-RETURNS void
-as $BODY$
-BEGIN
-
-    RAISE DEBUG 'Executing: %', query;
-
-    BEGIN
-        EXECUTE query;
-    EXCEPTION WHEN others THEN
-    END;
-
-    UPDATE pgzlog_metadata.log
-    SET last_applied_pos = pos
+    SELECT last_applied_pos INTO current_log_pos
+    FROM pgzlog_metadata.log
     WHERE name = log_name;
+
+    current_log_pos := current_log_pos + 1;
+
+    ASSERT current_log_pos <= tail_log_pos;
+
+    WHILE current_log_pos < tail_log_pos LOOP
+
+        SELECT * FROM pgzlog_read_log(log_name, current_log_pos) INTO query;
+
+        RAISE DEBUG 'Executing: %', query;
+
+        BEGIN
+            EXECUTE query;
+            EXCEPTION WHEN others THEN
+        END;
+
+        UPDATE pgzlog_metadata.log
+        SET last_applied_pos = current_log_pos
+        WHERE name = log_name;
+
+        current_log_pos := current_log_pos + 1;
+
+    END LOOP;
 END;
 $BODY$ LANGUAGE 'plpgsql';
+
+/*
+ *
+ */
+CREATE FUNCTION pgzlog_read_log(log_name text, pos bigint)
+RETURNS text
+LANGUAGE C STRICT
+AS 'MODULE_PATHNAME', $$pgzlog_read_log$$;

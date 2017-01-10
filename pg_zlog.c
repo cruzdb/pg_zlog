@@ -28,17 +28,8 @@
 
 #include <zlog/capi.h>
 
-#define PG_ZLOG_EXTENSION_NAME "pg_zlog"
-#define PG_ZLOG_REPLICATED_TABLE_NAME "replicated_tables"
-#define ATTR_NUM_REPLICATED_TABLES_RELATION_ID 1
-#define ATTR_NUM_REPLICATED_TABLES_LOG 2
-#define MAX_ZLOG_LOG_NAME_LENGTH 128
-
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;
-
-/* exports for SQL callable functions */
-PG_FUNCTION_INFO_V1(zlog_execute);
 
 /* whether writes go through zlog */
 static bool ZLogEnabled = true;
@@ -274,105 +265,47 @@ ZLogSetApplied(const char *logName, int64 pos)
 	SPI_finish();
 }
 
-static int64
-ZLogLastAppliedPos(const char *logName)
+/*
+ *
+ */
+PG_FUNCTION_INFO_V1(pgzlog_read_log);
+Datum
+pgzlog_read_log(PG_FUNCTION_ARGS)
 {
+	char readQuery[4096];
+	const char *log_name;
+	ZLogConn *conn;
 	int64 pos;
-	Datum posDatum;
-	bool isNull;
-	Oid argTypes[] = {
-		TEXTOID
-	};
-	Datum argValues[] = {
-		CStringGetTextDatum(logName)
-	};
+	int ret;
 
-	SPI_connect();
+	log_name = text_to_cstring(PG_GETARG_TEXT_P(0));
+	pos = PG_GETARG_INT64(1);
+	conn = GetConnection(log_name);
 
-	SPI_execute_with_args(
-		"SELECT last_applied_pos FROM pgzlog_metadata.log WHERE name = $1",
-		1, argTypes, argValues, NULL, false, 1);
+	MemSet(readQuery, 0, sizeof(readQuery));
 
-	posDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
-			1, &isNull);
-	pos = DatumGetInt64(posDatum);
+	ret = zlog_read(conn->log, pos, readQuery, sizeof(readQuery)-1);
+	if (ret < 0)
+	{
+		ereport(ERROR, (errmsg("pg_zlog cannot read log: %d", ret)));
+	}
 
-	SPI_finish();
-
-	return pos;
+	PG_RETURN_TEXT_P(cstring_to_text(readQuery));
 }
 
-/*
- * TODO:
- * - handle errors like not-written and filled
- * - handle large query strings. is there psql limit?
- */
 static void
-ApplyLogEntries(ZLogConn *conn, const char *logName,
-		const int64 start, const int64 end)
+ApplyLogEntries(const char *log_name, int64 tail)
 {
-	int64 cur;
+	Oid argTypes[] = {TEXTOID, INT8OID};
+	Datum argValues[] = {
+		CStringGetTextDatum(log_name),
+		Int64GetDatum(tail)
+	};
 
 	SPI_connect();
 
-	/*
-	 * Grab lock and disable Paxos. This could also be pushed down into
-	 * pgzlog_apply_update, it just needs to be done at least once.
-	 */
-	{
-		int ret;
-		Datum argValues[] = {CStringGetTextDatum(logName)};
-		Oid argTypes[] = {TEXTOID};
-
-		ret = SPI_execute_with_args("SELECT pgzlog_start_update($1)",
-				1, argTypes, argValues, NULL, false, 0);
-		if (ret < 0)
-		{
-			ereport(ERROR, (errmsg("pg_zlog cannot prepare update: %d", ret)));
-		}
-
-		CommandCounterIncrement();
-	}
-
-	if (start > end)
-	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("pg_zlog unexpected from/to "
-			INT64_FORMAT "/" INT64_FORMAT, start, end)));
-	}
-	else if (start == end)
-	{
-		SPI_finish();
-		return;
-	}
-
-	for (cur = start; cur < end; cur++)
-	{
-		char readQuery[4096];
-		Datum argValues[3];
-		Oid argTypes[] = {
-			TEXTOID,
-			TEXTOID,
-			INT8OID
-		};
-
-		int ret = zlog_read(conn->log, cur, readQuery, sizeof(readQuery));
-		if (ret < 0)
-		{
-			ereport(ERROR, (errmsg("pg_zlog cannot read log: %d", ret)));
-		}
-
-		argValues[0] = CStringGetTextDatum(logName);
-		argValues[1] = CStringGetTextDatum(readQuery);
-		argValues[2] = Int64GetDatum(cur);
-
-		ret = SPI_execute_with_args("SELECT pgzlog_apply_update($1,$2,$3)",
-				3, argTypes, argValues, NULL, false, 1);
-		if (ret < 0)
-		{
-			ereport(ERROR, (errmsg("pg_zlog cannot apply query: %d", ret)));
-		}
-	}
+	SPI_execute_with_args("SELECT pgzlog_apply_log($1,$2)",
+		2, argTypes, argValues, NULL, false, 1);
 
 	SPI_finish();
 }
@@ -384,7 +317,6 @@ ApplyLogEntries(ZLogConn *conn, const char *logName,
 static void PrepareConsistentRead(const char *logName)
 {
 	uint64_t tail;
-	int64 last_applied;
 	int ret;
 	ZLogConn *conn;
 
@@ -396,9 +328,7 @@ static void PrepareConsistentRead(const char *logName)
 		ereport(ERROR, (errmsg("pg_zlog could not check tail: %d", ret)));
 	}
 
-	last_applied = ZLogLastAppliedPos(logName);
-
-	ApplyLogEntries(conn, logName, last_applied+1, (int64)tail);
+	ApplyLogEntries(logName, (int64)tail);
 	CommandCounterIncrement();
 }
 
@@ -406,7 +336,6 @@ static void PrepareConsistentWrite(const char *logName, const char *queryString)
 {
 	int ret;
 	uint64_t appended_pos;
-	int64 last_applied;
 	ZLogConn *conn;
 
 	conn = GetConnection(logName);
@@ -418,9 +347,7 @@ static void PrepareConsistentWrite(const char *logName, const char *queryString)
 		ereport(ERROR, (errmsg("pg_zlog could not append to log: %d", ret)));
 	}
 
-	last_applied = ZLogLastAppliedPos(logName);
-
-	ApplyLogEntries(conn, logName, last_applied+1, (int64)appended_pos);
+	ApplyLogEntries(logName, (int64)appended_pos);
 	CommandCounterIncrement();
 
 	ZLogSetApplied(logName, (int64)appended_pos);
@@ -866,6 +793,7 @@ PgZLogExecutorStart(QueryDesc *queryDesc, int eflags)
  * zlog_execute is a placeholder function to store a query string in
  * in plain postgres node trees.
  */
+PG_FUNCTION_INFO_V1(zlog_execute);
 Datum
 zlog_execute(PG_FUNCTION_ARGS)
 {
