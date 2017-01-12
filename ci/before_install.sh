@@ -28,12 +28,6 @@ popd # ceph-deploy
 git clone --branch zlog/master --recursive https://github.com/noahdesu/ceph
 pushd ceph
 ./install-deps.sh
-
-/usr/bin/python2 -m cython --version
-echo $?
-ls -l /usr/bin/python*
-exit 0
-
 ./do_cmake.sh
 pushd build
 make cls_zlog cls_zlog_client
