@@ -3,6 +3,8 @@
 set -e
 set -x
 
+PGZLOG_BRANCH="testing"
+
 ### install deps
 apt-get update
 apt-get install -y git postgresql postgresql-contrib postgresql-server-dev-all
@@ -15,7 +17,7 @@ sudo make install
 popd
 
 ### install pg_zlog
-git clone --testing https://github.com/noahdesu/pg_zlog
+git clone --branch $PGZLOG_TESTING https://github.com/noahdesu/pg_zlog
 pushd pg_zlog
 make
 sudo make install
