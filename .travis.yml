@@ -2,4 +2,5 @@ dist: trust
 sudo: required
 language: cpp
 
+before_install: ci/before_install.sh
 script: exit 0
