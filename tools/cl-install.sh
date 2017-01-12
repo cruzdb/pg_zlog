@@ -4,6 +4,8 @@ set -e
 set -x
 
 HOST=$(hostname --short)
+CEPH_BRANCH="zlog/master"
+ZLOG_BRANCH="install"
 
 # install deps
 apt-get update
@@ -18,7 +20,7 @@ pushd ceph-deploy
 popd
 
 # build and install ceph zlog plugin
-git clone --branch zlog/master --recursive https://github.com/noahdesu/ceph
+git clone --branch $CEPH_BRANCH --recursive https://github.com/noahdesu/ceph
 pushd ceph
 ./install-deps.sh
 ./do_cmake.sh
@@ -31,7 +33,7 @@ popd
 popd
 
 # build and install zlog
-git clone --branch install --recursive https://github.com/noahdesu/zlog
+git clone --branch $ZLOG_BRANCH --recursive https://github.com/noahdesu/zlog
 pushd zlog
 mkdir build
 pushd build
