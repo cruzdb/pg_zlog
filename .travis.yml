@@ -1,0 +1,5 @@
+dist: trust
+sudo: required
+language: cpp
+
+script: exit 0
