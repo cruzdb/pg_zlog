@@ -17,7 +17,7 @@ sudo make install
 popd
 
 ### install pg_zlog
-git clone --branch $PGZLOG_TESTING https://github.com/noahdesu/pg_zlog
+git clone --branch $PGZLOG_BRANCH https://github.com/noahdesu/pg_zlog
 pushd pg_zlog
 make
 sudo make install
