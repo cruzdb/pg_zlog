@@ -29,6 +29,8 @@ git clone --branch zlog/master --recursive https://github.com/noahdesu/ceph
 pushd ceph
 ./install-deps.sh
 ./do_cmake.sh
+cat /home/travis/workdir/ceph/build/CMakeFiles/CMakeOutput.log
+cat /home/travis/workdir/ceph/build/CMakeFiles/CMakeError.log
 pushd build
 make cls_zlog cls_zlog_client
 cp lib/libcls_zlog_client.so /usr/lib/
